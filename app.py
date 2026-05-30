@@ -1,30 +1,20 @@
 """
-Band Rehearsal Scheduler - Streamlit Web App
-===========================================
+Band Rehearsal Scheduler - Streamlit + Google Sheets Web App
+============================================================
 
-밴드부 합주 일정을 팀별 링크로 조율할 수 있는 Streamlit 웹앱입니다.
+밴드부 합주 일정을 팀별 링크로 조율하는 Streamlit 웹앱입니다.
+데이터는 Google Apps Script를 통해 Google Sheets에 저장합니다.
 
-핵심 기능
-- 운영진이 팀/곡/팀원/날짜/시간/필수 파트를 입력해 팀 생성
-- 팀별 제출 링크 생성
-- 팀원이 링크에 접속해 이름/파트/가능 시간을 체크하고 제출
-- 운영진 결과 페이지에서 제출 현황, 미제출자, 파트 충족 여부, 추천 합주 시간 확인
-- 공지용 요약문 자동 생성
-- CSV 다운로드
+필요 파일
+- app.py
+- requirements.txt
 
-실행 방법
-1) 필요한 패키지 설치
-   pip install streamlit
+requirements.txt 내용
+streamlit
+requests
 
-2) 이 파일을 app.py로 저장
-
-3) 실행
-   streamlit run app.py
-
-주의
-- 현재 버전은 SQLite 파일을 사용하는 간단한 웹앱입니다.
-- 로컬에서 실행하면 같은 컴퓨터에서만 localhost 링크가 열립니다.
-- 실제 부원들이 접속하려면 Streamlit Community Cloud 등에 배포해야 합니다.
+Streamlit Cloud Secrets에 아래 값을 추가해야 합니다.
+GAS_WEB_APP_URL = "https://script.google.com/macros/s/여기에_앱스스크립트_URL/exec"
 """
 
 from __future__ import annotations
@@ -32,16 +22,13 @@ from __future__ import annotations
 import csv
 import io
 import json
-import sqlite3
-import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import requests
 import streamlit as st
 
-DB_PATH = Path("band_schedule_web.db")
 APP_BASE_URL = "https://dailyparty-band-scheduler.streamlit.app"
 PARTS = ["보컬", "기타1", "기타2", "베이스", "드럼", "건반", "기타/그 외"]
 DEFAULT_REQUIRED_PARTS = {
@@ -79,57 +66,126 @@ class Response:
 
 
 # -----------------------------
-# Database
+# Google Apps Script API
 # -----------------------------
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_gas_url() -> str:
+    try:
+        url = st.secrets.get("GAS_WEB_APP_URL", "")
+    except Exception:
+        url = ""
+    return str(url).strip()
 
 
-def init_db() -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS teams (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                songs TEXT,
-                members TEXT NOT NULL,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                start_time TEXT NOT NULL,
-                end_time TEXT NOT NULL,
-                slot_minutes INTEGER NOT NULL,
-                required_parts TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS responses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                team_id TEXT NOT NULL,
-                member_name TEXT NOT NULL,
-                part TEXT NOT NULL,
-                selected_slots TEXT NOT NULL,
-                submitted_at TEXT NOT NULL,
-                UNIQUE(team_id, member_name),
-                FOREIGN KEY(team_id) REFERENCES teams(id)
-            )
-            """
-        )
+def api_get(action: str, params: Optional[Dict[str, str]] = None) -> Dict[str, object]:
+    url = get_gas_url()
+    if not url:
+        raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
+
+    query = {"action": action}
+    if params:
+        query.update(params)
+
+    response = requests.get(url, params=query, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error", "Google Apps Script API 오류")))
+    return data
 
 
-def parse_date(value: str) -> date:
-    return datetime.strptime(value, "%Y-%m-%d").date()
+def api_post(payload: Dict[str, object]) -> Dict[str, object]:
+    url = get_gas_url()
+    if not url:
+        raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
+
+    response = requests.post(url, json=payload, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error", "Google Apps Script API 오류")))
+    return data
 
 
-def parse_time(value: str) -> time:
-    return datetime.strptime(value, "%H:%M").time()
+# -----------------------------
+# Parsing helpers
+# -----------------------------
+def parse_date(value: object) -> date:
+    text = str(value).strip()
+    # Google Sheets may return ISO datetime strings depending on formatting.
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    return datetime.strptime(text, "%Y-%m-%d").date()
 
 
+def parse_time(value: object) -> time:
+    text = str(value).strip()
+    if "T" in text:
+        # Defensive fallback for date-time strings.
+        text = text.split("T", 1)[1][:5]
+    return datetime.strptime(text[:5], "%H:%M").time()
+
+
+def parse_json_list(value: object) -> List[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except json.JSONDecodeError:
+        pass
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def parse_json_dict(value: object) -> Dict[str, int]:
+    if isinstance(value, dict):
+        return {str(k): int(v) for k, v in value.items()}
+    text = str(value or "").strip()
+    if not text:
+        return DEFAULT_REQUIRED_PARTS.copy()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            result = DEFAULT_REQUIRED_PARTS.copy()
+            for key, val in parsed.items():
+                result[str(key)] = int(val)
+            return result
+    except json.JSONDecodeError:
+        pass
+    return DEFAULT_REQUIRED_PARTS.copy()
+
+
+def row_to_team(row: Dict[str, object]) -> Team:
+    return Team(
+        id=str(row.get("team_id", "")).strip(),
+        name=str(row.get("name", "")).strip(),
+        songs=str(row.get("songs", "")).strip(),
+        members=parse_json_list(row.get("members", "[]")),
+        start_date=parse_date(row.get("start_date", "2000-01-01")),
+        end_date=parse_date(row.get("end_date", "2000-01-01")),
+        start_time=parse_time(row.get("start_time", "18:00")),
+        end_time=parse_time(row.get("end_time", "22:00")),
+        slot_minutes=int(float(row.get("slot_minutes", 60) or 60)),
+        required_parts=parse_json_dict(row.get("required_parts", "{}")),
+        created_at=str(row.get("created_at", "")),
+    )
+
+
+def row_to_response(row: Dict[str, object]) -> Response:
+    return Response(
+        member_name=str(row.get("member_name", "")).strip(),
+        part=str(row.get("part", "")).strip(),
+        selected_slots=parse_json_list(row.get("selected_slots", "[]")),
+        submitted_at=str(row.get("submitted_at", "")),
+    )
+
+
+# -----------------------------
+# Data access
+# -----------------------------
 def create_team(
     name: str,
     songs: str,
@@ -141,105 +197,57 @@ def create_team(
     slot_minutes: int,
     required_parts: Dict[str, int],
 ) -> str:
-    team_id = uuid.uuid4().hex[:8]
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO teams (
-                id, name, songs, members, start_date, end_date, start_time, end_time,
-                slot_minutes, required_parts, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                team_id,
-                name.strip(),
-                songs.strip(),
-                json.dumps(list(members), ensure_ascii=False),
-                start_date.isoformat(),
-                end_date.isoformat(),
-                start_time.strftime("%H:%M"),
-                end_time.strftime("%H:%M"),
-                int(slot_minutes),
-                json.dumps(required_parts, ensure_ascii=False),
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-    return team_id
+    data = api_post(
+        {
+            "action": "createTeam",
+            "name": name.strip(),
+            "songs": songs.strip(),
+            "members": list(members),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "start_time": start_time.strftime("%H:%M"),
+            "end_time": end_time.strftime("%H:%M"),
+            "slot_minutes": int(slot_minutes),
+            "required_parts": required_parts,
+        }
+    )
+    return str(data["team_id"])
 
 
 def get_team(team_id: str) -> Optional[Team]:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM teams WHERE id = ?", (team_id.strip(),)).fetchone()
-    if not row:
+    try:
+        data = api_get("getTeam", {"team_id": team_id})
+        return row_to_team(data["team"])  # type: ignore[arg-type]
+    except Exception:
         return None
-    return Team(
-        id=row["id"],
-        name=row["name"],
-        songs=row["songs"] or "",
-        members=json.loads(row["members"] or "[]"),
-        start_date=parse_date(row["start_date"]),
-        end_date=parse_date(row["end_date"]),
-        start_time=parse_time(row["start_time"]),
-        end_time=parse_time(row["end_time"]),
-        slot_minutes=int(row["slot_minutes"]),
-        required_parts=json.loads(row["required_parts"]),
-        created_at=row["created_at"],
-    )
 
 
 def list_teams() -> List[Team]:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT id FROM teams ORDER BY created_at DESC").fetchall()
-    teams = []
-    for row in rows:
-        team = get_team(row["id"])
-        if team:
-            teams.append(team)
-    return teams
+    data = api_get("getTeams")
+    rows = data.get("teams", [])
+    if not isinstance(rows, list):
+        return []
+    return [row_to_team(row) for row in rows if isinstance(row, dict)]
 
 
 def save_response(team_id: str, member_name: str, part: str, selected_slots: Sequence[str]) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO responses (team_id, member_name, part, selected_slots, submitted_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(team_id, member_name)
-            DO UPDATE SET
-                part = excluded.part,
-                selected_slots = excluded.selected_slots,
-                submitted_at = excluded.submitted_at
-            """,
-            (
-                team_id,
-                member_name.strip(),
-                part,
-                json.dumps(list(selected_slots), ensure_ascii=False),
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
+    api_post(
+        {
+            "action": "saveResponse",
+            "team_id": team_id,
+            "member_name": member_name.strip(),
+            "part": part,
+            "selected_slots": list(selected_slots),
+        }
+    )
 
 
 def get_responses(team_id: str) -> List[Response]:
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT member_name, part, selected_slots, submitted_at
-            FROM responses
-            WHERE team_id = ?
-            ORDER BY submitted_at DESC
-            """,
-            (team_id.strip(),),
-        ).fetchall()
-    return [
-        Response(
-            member_name=row["member_name"],
-            part=row["part"],
-            selected_slots=json.loads(row["selected_slots"]),
-            submitted_at=row["submitted_at"],
-        )
-        for row in rows
-    ]
+    data = api_get("getResponses", {"team_id": team_id})
+    rows = data.get("responses", [])
+    if not isinstance(rows, list):
+        return []
+    return [row_to_response(row) for row in rows if isinstance(row, dict)]
 
 
 # -----------------------------
@@ -410,6 +418,22 @@ def show_team_summary(team: Team) -> None:
     st.write(", ".join(f"{part} {count}명" for part, count in team.required_parts.items() if count > 0) or "없음")
 
 
+def check_setup() -> bool:
+    if get_gas_url():
+        return True
+    st.error("Google Apps Script URL이 아직 설정되지 않았습니다.")
+    st.markdown(
+        """
+Streamlit Cloud의 앱 관리 화면에서 **Settings → Secrets**에 아래 형식으로 값을 추가해 주세요.
+
+```toml
+GAS_WEB_APP_URL = "https://script.google.com/macros/s/여기에_웹앱_URL/exec"
+```
+"""
+    )
+    return False
+
+
 # -----------------------------
 # Pages
 # -----------------------------
@@ -465,7 +489,12 @@ def page_create_team() -> None:
             st.error("종료 시간은 시작 시간보다 늦어야 합니다.")
             return
 
-        team_id = create_team(name, songs, members, start_date, end_date, start_time, end_time, slot_minutes, required_parts)
+        try:
+            team_id = create_team(name, songs, members, start_date, end_date, start_time, end_time, slot_minutes, required_parts)
+        except Exception as exc:
+            st.error(f"팀 생성 중 오류가 발생했습니다: {exc}")
+            return
+
         links = build_links(team_id)
         st.success("팀이 생성되었습니다!")
         st.write(f"**팀 ID:** `{team_id}`")
@@ -473,7 +502,7 @@ def page_create_team() -> None:
         st.code(links["제출 링크"])
         st.markdown("#### 운영진 결과 확인 링크")
         st.code(links["결과 링크"])
-        st.info("로컬 실행 중에는 같은 컴퓨터에서만 위 링크가 열립니다. 실제 공유용 링크는 Streamlit Cloud 배포 후 생성됩니다.")
+        st.info("이제 위 제출 링크를 팀원들에게 공유하면 됩니다.")
 
 
 def page_submit() -> None:
@@ -527,11 +556,7 @@ def page_submit() -> None:
     if view_mode == "모바일 친화형":
         st.info("날짜별로 가능한 시간을 여러 개 선택하세요. 휴대폰 화면에서 가장 안정적으로 보이는 방식입니다.")
         for date_label in date_labels:
-            day_time_labels = [
-                time_label
-                for time_label in time_labels
-                if (date_label, time_label) in slot_map
-            ]
+            day_time_labels = [time_label for time_label in time_labels if (date_label, time_label) in slot_map]
             chosen_times = st.multiselect(
                 f"{date_label}",
                 options=day_time_labels,
@@ -593,7 +618,11 @@ def page_submit() -> None:
         if not selected_slots:
             st.error("가능한 시간을 최소 1개 이상 선택해 주세요.")
             return
-        save_response(team.id, member_name, part, selected_slots)
+        try:
+            save_response(team.id, member_name, part, selected_slots)
+        except Exception as exc:
+            st.error(f"제출 중 오류가 발생했습니다: {exc}")
+            return
         st.success("제출 완료! 같은 이름으로 다시 제출하면 기존 응답이 수정됩니다.")
 
 
@@ -661,7 +690,12 @@ def page_result() -> None:
 
 def page_team_list() -> None:
     st.header("팀 목록")
-    teams = list_teams()
+    try:
+        teams = list_teams()
+    except Exception as exc:
+        st.error(f"팀 목록을 불러오는 중 오류가 발생했습니다: {exc}")
+        return
+
     if not teams:
         st.info("아직 생성된 팀이 없습니다.")
         return
@@ -683,7 +717,6 @@ def page_team_list() -> None:
 # -----------------------------
 def main() -> None:
     st.set_page_config(page_title="밴드부 합주 일정 조율", page_icon="🎸", layout="wide")
-    init_db()
 
     st.title("🎸 밴드부 합주 일정 조율")
     st.caption("팀별 링크로 가능 시간을 수집하고, 파트 충족 여부와 최적 합주 시간을 자동으로 계산합니다.")
@@ -706,7 +739,10 @@ def main() -> None:
         )
         selected_page = reverse_options[selected_label]
         st.divider()
-        st.write("실제 공유용으로 쓰려면 Streamlit Cloud 배포가 필요합니다.")
+        st.write("데이터는 Google Sheets에 저장됩니다.")
+
+    if not check_setup():
+        return
 
     if selected_page == "create":
         page_create_team()
