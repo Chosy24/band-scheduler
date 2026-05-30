@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Sequence
 import streamlit as st
 
 DB_PATH = Path("band_schedule_web.db")
+APP_BASE_URL = "https://dailyparty-band-scheduler.streamlit.app"
 PARTS = ["보컬", "기타1", "기타2", "베이스", "드럼", "건반", "기타/그 외"]
 DEFAULT_REQUIRED_PARTS = {
     "보컬": 1,
@@ -392,8 +393,9 @@ def get_query_param(name: str, default: str = "") -> str:
 
 
 def build_links(team_id: str) -> Dict[str, str]:
-    submit_link = f"?page=submit&team={team_id}"
-    result_link = f"?page=result&team={team_id}"
+    base_url = APP_BASE_URL.rstrip("/")
+    submit_link = f"{base_url}/?page=submit&team={team_id}"
+    result_link = f"{base_url}/?page=result&team={team_id}"
     return {"제출 링크": submit_link, "결과 링크": result_link}
 
 
