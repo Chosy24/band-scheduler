@@ -496,9 +496,10 @@ def page_submit() -> None:
     part = st.selectbox("파트", PARTS)
 
     st.markdown("#### 가능한 시간을 체크해 주세요")
-    st.caption("날짜와 시간이 만나는 칸을 체크하면 됩니다. 같은 이름으로 다시 제출하면 기존 응답이 수정됩니다.")
+    st.caption("날짜와 시간이 만나는 칸을 체크하면 됩니다. 날짜가 많을 경우 7일 단위 탭으로 나누어 보여줍니다.")
 
     # When2meet-like grid: rows = time ranges, columns = dates.
+    # To keep the UI readable on laptops/phones, split dates into 7-day chunks.
     date_labels: List[str] = []
     time_labels: List[str] = []
     slot_map: Dict[tuple, str] = {}
@@ -518,32 +519,46 @@ def page_submit() -> None:
         st.error("선택 가능한 시간대가 없습니다. 팀 생성 시 날짜와 시간을 다시 확인해 주세요.")
         return
 
-    # Header row
-    header_cols = st.columns([1.25] + [1 for _ in date_labels])
-    with header_cols[0]:
-        st.markdown("**시간**")
-    for idx, date_label in enumerate(date_labels, start=1):
-        with header_cols[idx]:
-            st.markdown(f"**{date_label}**")
+    def chunk_list(items: List[str], size: int) -> List[List[str]]:
+        return [items[i : i + size] for i in range(0, len(items), size)]
 
-    # Checkbox grid
-    for time_label in time_labels:
-        row_cols = st.columns([1.25] + [1 for _ in date_labels])
-        with row_cols[0]:
-            st.markdown(f"**{time_label}**")
-        for idx, date_label in enumerate(date_labels, start=1):
-            slot_id = slot_map.get((time_label, date_label))
-            with row_cols[idx]:
-                if slot_id:
-                    checked = st.checkbox(
-                        "가능",
-                        key=f"grid_{team.id}_{member_name}_{part}_{slot_id}",
-                        label_visibility="collapsed",
-                    )
-                    if checked:
-                        selected_slots.append(slot_id)
-                else:
-                    st.write("-")
+    date_chunks = chunk_list(date_labels, 7)
+    tab_labels = []
+    for idx, chunk in enumerate(date_chunks, start=1):
+        if len(chunk) == 1:
+            tab_labels.append(chunk[0])
+        else:
+            tab_labels.append(f"{idx}주차: {chunk[0]} ~ {chunk[-1]}")
+
+    tabs = st.tabs(tab_labels)
+
+    for tab, chunk in zip(tabs, date_chunks):
+        with tab:
+            header_cols = st.columns([1.4] + [1 for _ in chunk])
+            with header_cols[0]:
+                st.markdown("**시간**")
+            for idx, date_label in enumerate(chunk, start=1):
+                short_label = date_label.replace("/", "/")
+                with header_cols[idx]:
+                    st.markdown(f"**{short_label}**")
+
+            for time_label in time_labels:
+                row_cols = st.columns([1.4] + [1 for _ in chunk])
+                with row_cols[0]:
+                    st.markdown(f"**{time_label}**")
+                for idx, date_label in enumerate(chunk, start=1):
+                    slot_id = slot_map.get((time_label, date_label))
+                    with row_cols[idx]:
+                        if slot_id:
+                            checked = st.checkbox(
+                                "가능",
+                                key=f"grid_{team.id}_{member_name}_{part}_{slot_id}",
+                                label_visibility="collapsed",
+                            )
+                            if checked:
+                                selected_slots.append(slot_id)
+                        else:
+                            st.write("-")
 
     submitted = st.button("제출하기", type="primary")
 
