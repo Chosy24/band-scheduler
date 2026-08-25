@@ -1,35 +1,13 @@
-"""
-Band Rehearsal Scheduler - Streamlit + Google Sheets Web App
-============================================================
-
-밴드부 합주 일정을 팀별 링크로 조율하는 Streamlit 웹앱입니다.
-데이터는 Google Apps Script를 통해 Google Sheets에 저장합니다.
-
-필요 파일
-- app.py
-- requirements.txt
-
-requirements.txt 내용
-streamlit
-requests
-
-Streamlit Cloud Secrets에 아래 값을 추가해야 합니다.
-GAS_WEB_APP_URL = "https://script.google.com/macros/s/여기에_앱스스크립트_URL/exec"
-"""
-
 from __future__ import annotations
 
-import csv
-import io
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 import streamlit as st
 
-APP_BASE_URL = "https://dailyparty-band-scheduler.streamlit.app"
 PARTS = ["보컬", "기타1", "기타2", "베이스", "드럼", "건반", "기타/그 외"]
 DEFAULT_REQUIRED_PARTS = {
     "보컬": 1,
@@ -43,49 +21,67 @@ DEFAULT_REQUIRED_PARTS = {
 
 
 @dataclass
-class Team:
+class SchedulePeriod:
     id: str
     name: str
-    songs: str
-    members: List[str]
     start_date: date
     end_date: date
     start_time: time
     end_time: time
     slot_minutes: int
-    required_parts: Dict[str, int]
-    created_at: str
 
 
 @dataclass
-class Response:
-    member_name: str
+class Member:
+    id: str
+    name: str
     part: str
+    active: bool = True
+
+
+@dataclass
+class Team:
+    id: str
+    schedule_id: str
+    name: str
+    songs: str
+    member_ids: List[str]
+    required_parts: Dict[str, int]
+
+
+@dataclass
+class PersonalSchedule:
+    schedule_id: str
+    member_id: str
     selected_slots: List[str]
-    submitted_at: str
+    submitted_at: str = ""
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Google Apps Script API
-# -----------------------------
+# -----------------------------------------------------------------------------
 def get_gas_url() -> str:
     try:
-        url = st.secrets.get("GAS_WEB_APP_URL", "")
+        return str(st.secrets.get("GAS_WEB_APP_URL", "")).strip()
     except Exception:
-        url = ""
-    return str(url).strip()
+        return ""
+
+
+def get_admin_pin() -> str:
+    try:
+        return str(st.secrets.get("ADMIN_PIN", "")).strip()
+    except Exception:
+        return ""
 
 
 def api_get(action: str, params: Optional[Dict[str, str]] = None) -> Dict[str, object]:
     url = get_gas_url()
     if not url:
         raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
-
     query = {"action": action}
     if params:
         query.update(params)
-
-    response = requests.get(url, params=query, timeout=15)
+    response = requests.get(url, params=query, timeout=20)
     response.raise_for_status()
     data = response.json()
     if not data.get("ok"):
@@ -97,8 +93,7 @@ def api_post(payload: Dict[str, object]) -> Dict[str, object]:
     url = get_gas_url()
     if not url:
         raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
-
-    response = requests.post(url, json=payload, timeout=15)
+    response = requests.post(url, json=payload, timeout=20)
     response.raise_for_status()
     data = response.json()
     if not data.get("ok"):
@@ -106,652 +101,800 @@ def api_post(payload: Dict[str, object]) -> Dict[str, object]:
     return data
 
 
-# -----------------------------
-# Parsing helpers
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Parsing
+# -----------------------------------------------------------------------------
 def parse_date(value: object) -> date:
-    text = str(value).strip()
-    # Google Sheets may return ISO datetime strings depending on formatting.
-    if "T" in text:
-        text = text.split("T", 1)[0]
+    text = str(value).strip().split("T", 1)[0]
     return datetime.strptime(text, "%Y-%m-%d").date()
 
 
 def parse_time(value: object) -> time:
     text = str(value).strip()
     if "T" in text:
-        # Defensive fallback for date-time strings.
-        text = text.split("T", 1)[1][:5]
+        text = text.split("T", 1)[1]
     return datetime.strptime(text[:5], "%H:%M").time()
 
 
 def parse_json_list(value: object) -> List[str]:
     if isinstance(value, list):
-        return [str(item) for item in value]
+        return [str(v) for v in value]
     text = str(value or "").strip()
     if not text:
         return []
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return [str(item) for item in parsed]
+        return [str(v) for v in parsed] if isinstance(parsed, list) else []
     except json.JSONDecodeError:
-        pass
-    return [item.strip() for item in text.split(",") if item.strip()]
+        return []
 
 
 def parse_json_dict(value: object) -> Dict[str, int]:
+    result = DEFAULT_REQUIRED_PARTS.copy()
     if isinstance(value, dict):
-        return {str(k): int(v) for k, v in value.items()}
+        for key, val in value.items():
+            result[str(key)] = int(val)
+        return result
     text = str(value or "").strip()
     if not text:
-        return DEFAULT_REQUIRED_PARTS.copy()
+        return result
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            result = DEFAULT_REQUIRED_PARTS.copy()
             for key, val in parsed.items():
                 result[str(key)] = int(val)
-            return result
     except json.JSONDecodeError:
         pass
-    return DEFAULT_REQUIRED_PARTS.copy()
+    return result
+
+
+def row_to_period(row: Dict[str, object]) -> SchedulePeriod:
+    return SchedulePeriod(
+        id=str(row.get("schedule_id", "")).strip(),
+        name=str(row.get("name", "")).strip(),
+        start_date=parse_date(row.get("start_date", date.today().isoformat())),
+        end_date=parse_date(row.get("end_date", date.today().isoformat())),
+        start_time=parse_time(row.get("start_time", "18:00")),
+        end_time=parse_time(row.get("end_time", "22:00")),
+        slot_minutes=int(float(row.get("slot_minutes", 60) or 60)),
+    )
+
+
+def row_to_member(row: Dict[str, object]) -> Member:
+    active_value = row.get("active", True)
+    active = str(active_value).lower() not in {"false", "0", "no", "n"}
+    return Member(
+        id=str(row.get("member_id", "")).strip(),
+        name=str(row.get("name", "")).strip(),
+        part=str(row.get("part", "기타/그 외")).strip() or "기타/그 외",
+        active=active,
+    )
 
 
 def row_to_team(row: Dict[str, object]) -> Team:
     return Team(
         id=str(row.get("team_id", "")).strip(),
+        schedule_id=str(row.get("schedule_id", "")).strip(),
         name=str(row.get("name", "")).strip(),
         songs=str(row.get("songs", "")).strip(),
-        members=parse_json_list(row.get("members", "[]")),
-        start_date=parse_date(row.get("start_date", "2000-01-01")),
-        end_date=parse_date(row.get("end_date", "2000-01-01")),
-        start_time=parse_time(row.get("start_time", "18:00")),
-        end_time=parse_time(row.get("end_time", "22:00")),
-        slot_minutes=int(float(row.get("slot_minutes", 60) or 60)),
+        member_ids=parse_json_list(row.get("member_ids", "[]")),
         required_parts=parse_json_dict(row.get("required_parts", "{}")),
-        created_at=str(row.get("created_at", "")),
     )
 
 
-def row_to_response(row: Dict[str, object]) -> Response:
-    return Response(
-        member_name=str(row.get("member_name", "")).strip(),
-        part=str(row.get("part", "")).strip(),
+def row_to_personal_schedule(row: Dict[str, object]) -> PersonalSchedule:
+    return PersonalSchedule(
+        schedule_id=str(row.get("schedule_id", "")).strip(),
+        member_id=str(row.get("member_id", "")).strip(),
         selected_slots=parse_json_list(row.get("selected_slots", "[]")),
         submitted_at=str(row.get("submitted_at", "")),
     )
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Data access
-# -----------------------------
-def create_team(
-    name: str,
-    songs: str,
-    members: Sequence[str],
-    start_date: date,
-    end_date: date,
-    start_time: time,
-    end_time: time,
-    slot_minutes: int,
-    required_parts: Dict[str, int],
-) -> str:
-    data = api_post(
-        {
-            "action": "createTeam",
-            "name": name.strip(),
-            "songs": songs.strip(),
-            "members": list(members),
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "start_time": start_time.strftime("%H:%M"),
-            "end_time": end_time.strftime("%H:%M"),
-            "slot_minutes": int(slot_minutes),
-            "required_parts": required_parts,
-        }
-    )
+# -----------------------------------------------------------------------------
+def get_current_period() -> Optional[SchedulePeriod]:
+    data = api_get("getSettings")
+    row = data.get("settings")
+    if not isinstance(row, dict) or not row.get("schedule_id"):
+        return None
+    return row_to_period(row)
+
+
+def save_period(name: str, start_date: date, end_date: date, start_time: time, end_time: time, slot_minutes: int) -> str:
+    data = api_post({
+        "action": "saveSettings",
+        "name": name.strip(),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "start_time": start_time.strftime("%H:%M"),
+        "end_time": end_time.strftime("%H:%M"),
+        "slot_minutes": int(slot_minutes),
+    })
+    return str(data["schedule_id"])
+
+
+def list_members(active_only: bool = True) -> List[Member]:
+    data = api_get("getMembers", {"active_only": "true" if active_only else "false"})
+    rows = data.get("members", [])
+    return [row_to_member(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def add_members(rows: Sequence[Dict[str, str]]) -> None:
+    api_post({"action": "addMembers", "members": list(rows)})
+
+
+def save_personal_schedule(schedule_id: str, member_id: str, selected_slots: Sequence[str]) -> None:
+    api_post({
+        "action": "savePersonalSchedule",
+        "schedule_id": schedule_id,
+        "member_id": member_id,
+        "selected_slots": list(selected_slots),
+    })
+
+
+def get_personal_schedule(schedule_id: str, member_id: str) -> Optional[PersonalSchedule]:
+    data = api_get("getMemberSchedule", {"schedule_id": schedule_id, "member_id": member_id})
+    row = data.get("schedule")
+    return row_to_personal_schedule(row) if isinstance(row, dict) else None
+
+
+def create_team(schedule_id: str, name: str, songs: str, member_ids: Sequence[str], required_parts: Dict[str, int]) -> str:
+    data = api_post({
+        "action": "createTeam",
+        "schedule_id": schedule_id,
+        "name": name.strip(),
+        "songs": songs.strip(),
+        "member_ids": list(member_ids),
+        "required_parts": required_parts,
+    })
     return str(data["team_id"])
 
 
-def get_team(team_id: str) -> Optional[Team]:
-    try:
-        data = api_get("getTeam", {"team_id": team_id})
-        return row_to_team(data["team"])  # type: ignore[arg-type]
-    except Exception:
-        return None
+def delete_team(team_id: str) -> None:
+    api_post({"action": "deleteTeam", "team_id": team_id})
 
 
-def list_teams() -> List[Team]:
-    data = api_get("getTeams")
+def list_teams(schedule_id: Optional[str] = None) -> List[Team]:
+    params = {"schedule_id": schedule_id} if schedule_id else None
+    data = api_get("getTeams", params)
     rows = data.get("teams", [])
-    if not isinstance(rows, list):
-        return []
-    return [row_to_team(row) for row in rows if isinstance(row, dict)]
+    return [row_to_team(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
-def save_response(team_id: str, member_name: str, part: str, selected_slots: Sequence[str]) -> None:
-    api_post(
-        {
-            "action": "saveResponse",
-            "team_id": team_id,
-            "member_name": member_name.strip(),
-            "part": part,
-            "selected_slots": list(selected_slots),
-        }
-    )
+def get_team_bundle(team_id: str) -> Tuple[Optional[Team], List[Member], Dict[str, PersonalSchedule]]:
+    data = api_get("getTeamBundle", {"team_id": team_id})
+    team_row = data.get("team")
+    if not isinstance(team_row, dict):
+        return None, [], {}
+    team = row_to_team(team_row)
+    members_raw = data.get("members", [])
+    schedules_raw = data.get("schedules", [])
+    members = [row_to_member(r) for r in members_raw if isinstance(r, dict)] if isinstance(members_raw, list) else []
+    schedules_list = [row_to_personal_schedule(r) for r in schedules_raw if isinstance(r, dict)] if isinstance(schedules_raw, list) else []
+    schedules = {s.member_id: s for s in schedules_list}
+    return team, members, schedules
 
 
-def get_responses(team_id: str) -> List[Response]:
-    data = api_get("getResponses", {"team_id": team_id})
-    rows = data.get("responses", [])
-    if not isinstance(rows, list):
-        return []
-    return [row_to_response(row) for row in rows if isinstance(row, dict)]
+def save_final_schedule(schedule_id: str, team_id: str, start_dt: datetime, end_dt: datetime) -> None:
+    api_post({
+        "action": "saveFinalSchedule",
+        "schedule_id": schedule_id,
+        "team_id": team_id,
+        "start_dt": start_dt.isoformat(timespec="minutes"),
+        "end_dt": end_dt.isoformat(timespec="minutes"),
+    })
 
 
-# -----------------------------
+def list_final_schedules(schedule_id: str) -> List[Dict[str, object]]:
+    data = api_get("getFinalSchedules", {"schedule_id": schedule_id})
+    rows = data.get("final_schedules", [])
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def delete_final_schedule(final_id: str) -> None:
+    api_post({"action": "deleteFinalSchedule", "final_id": final_id})
+
+
+# -----------------------------------------------------------------------------
 # Scheduling logic
-# -----------------------------
+# -----------------------------------------------------------------------------
 def weekday_kr(d: date) -> str:
     return ["월", "화", "수", "목", "금", "토", "일"][d.weekday()]
 
 
-def generate_slots(team: Team) -> List[Dict[str, object]]:
+def generate_slots(period: SchedulePeriod) -> List[Dict[str, object]]:
     slots: List[Dict[str, object]] = []
-    current_date = team.start_date
-    while current_date <= team.end_date:
-        current = datetime.combine(current_date, team.start_time)
-        end_dt = datetime.combine(current_date, team.end_time)
-        while current + timedelta(minutes=team.slot_minutes) <= end_dt:
-            next_time = current + timedelta(minutes=team.slot_minutes)
+    current_date = period.start_date
+    while current_date <= period.end_date:
+        current = datetime.combine(current_date, period.start_time)
+        end_dt = datetime.combine(current_date, period.end_time)
+        while current + timedelta(minutes=period.slot_minutes) <= end_dt:
+            nxt = current + timedelta(minutes=period.slot_minutes)
             slot_id = current.isoformat(timespec="minutes")
-            label = f"{current_date.strftime('%m/%d')}({weekday_kr(current_date)}) {current.strftime('%H:%M')}-{next_time.strftime('%H:%M')}"
-            slots.append(
-                {
-                    "id": slot_id,
-                    "label": label,
-                    "date": current_date.isoformat(),
-                    "date_label": f"{current_date.strftime('%m/%d')}({weekday_kr(current_date)})",
-                    "time_label": f"{current.strftime('%H:%M')}-{next_time.strftime('%H:%M')}",
-                    "start_hour": current.hour,
-                }
-            )
-            current = next_time
+            slots.append({
+                "id": slot_id,
+                "date": current_date,
+                "date_label": f"{current_date.strftime('%m/%d')}({weekday_kr(current_date)})",
+                "start": current,
+                "end": nxt,
+                "time_label": f"{current.strftime('%H:%M')}-{nxt.strftime('%H:%M')}",
+            })
+            current = nxt
         current_date += timedelta(days=1)
     return slots
 
 
-def time_preference_score(slot: Dict[str, object]) -> int:
-    hour = int(slot.get("start_hour", 0))
-    if 18 <= hour <= 21:
-        return 10
-    if 15 <= hour < 18:
-        return 6
-    if 12 <= hour < 15:
-        return 3
-    return 0
-
-
-def analyze_availability(team: Team, responses: Sequence[Response]) -> List[Dict[str, object]]:
-    rows: List[Dict[str, object]] = []
-    slots = generate_slots(team)
-
-    for slot in slots:
-        available = [response for response in responses if str(slot["id"]) in response.selected_slots]
-        part_counts = {part: 0 for part in PARTS}
-        for response in available:
-            part_counts[response.part] = part_counts.get(response.part, 0) + 1
-
-        missing = []
-        for part, required_count in team.required_parts.items():
-            current_count = part_counts.get(part, 0)
-            if required_count > 0 and current_count < required_count:
-                missing.append(f"{part} {required_count - current_count}명")
-
-        part_ok = not missing
-        member_score = len(available) * 10
-        part_score = 50 if part_ok else 0
-        time_score = time_preference_score(slot)
-        total_score = member_score + part_score + time_score
-
-        rows.append(
-            {
-                "시간대": slot["label"],
-                "추천 점수": total_score,
-                "가능 인원": len(available),
-                "가능 멤버": ", ".join(f"{r.member_name}({r.part})" for r in available),
-                "파트 충족": "충족" if part_ok else "부족",
-                "부족한 파트": "없음" if part_ok else ", ".join(missing),
-                "점수 산식": f"인원 {member_score} + 파트 {part_score} + 시간대 {time_score}",
-            }
-        )
-
-    rows.sort(key=lambda row: (int(row["추천 점수"]), int(row["가능 인원"])), reverse=True)
-    return rows
-
-
-def get_missing_members(team: Team, responses: Sequence[Response]) -> List[str]:
-    submitted = {response.member_name.strip() for response in responses}
-    return [member for member in team.members if member.strip() and member.strip() not in submitted]
-
-
-def make_notice(team: Team, responses: Sequence[Response], results: Sequence[Dict[str, object]], missing_members: Sequence[str]) -> str:
-    if not responses:
-        return f"[{team.name} 합주 일정 조율 현황]\n아직 제출된 응답이 없습니다. 팀원들에게 가능 시간 제출을 요청해 주세요."
-
-    if not results:
-        return f"[{team.name} 합주 일정 조율 현황]\n추천 가능한 시간대가 없습니다."
-
-    best = results[0]
-    submitted_count = len(responses)
-    total_members = len(team.members)
-
-    if best["파트 충족"] == "충족":
-        decision = (
-            f"현재 기준 가장 적합한 합주 시간은 {best['시간대']}입니다. "
-            f"해당 시간에는 필수 파트 조건이 충족되며, 가능 인원은 {best['가능 인원']}명입니다."
-        )
-    else:
-        decision = (
-            f"현재 기준 가장 가능 인원이 많은 시간은 {best['시간대']}입니다. "
-            f"다만 {best['부족한 파트']}이 부족하여 추가 조율이 필요합니다."
-        )
-
-    missing_text = f"\n아직 미제출 인원은 {', '.join(missing_members)}입니다." if missing_members else ""
-
-    return (
-        f"[{team.name} 합주 일정 조율 현황]\n"
-        f"현재 총 {total_members}명 중 {submitted_count}명이 가능 시간을 제출했습니다.\n"
-        f"{decision}\n"
-        f"가능 멤버: {best['가능 멤버']}{missing_text}"
-    )
-
-
-def to_csv_bytes(rows: Sequence[Dict[str, object]]) -> bytes:
-    if not rows:
-        return "".encode("utf-8-sig")
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()))
-    writer.writeheader()
-    writer.writerows(rows)
-    return buffer.getvalue().encode("utf-8-sig")
-
-
-def response_rows(responses: Sequence[Response]) -> List[Dict[str, object]]:
-    return [
-        {
-            "이름": response.member_name,
-            "파트": response.part,
-            "선택한 시간 수": len(response.selected_slots),
-            "제출 시각": response.submitted_at,
-        }
-        for response in responses
-    ]
-
-
-# -----------------------------
-# UI helpers
-# -----------------------------
-def get_query_param(name: str, default: str = "") -> str:
-    value = st.query_params.get(name, default)
-    if isinstance(value, list):
-        return value[0] if value else default
-    return value or default
-
-
-def build_links(team_id: str) -> Dict[str, str]:
-    base_url = APP_BASE_URL.rstrip("/")
-    submit_link = f"{base_url}/?page=submit&team={team_id}"
-    result_link = f"{base_url}/?page=result&team={team_id}"
-    return {"제출 링크": submit_link, "결과 링크": result_link}
-
-
-def show_team_summary(team: Team) -> None:
-    st.markdown(f"### {team.name}")
-    if team.songs:
-        st.write("**곡명**")
-        st.write(team.songs)
-    st.write(f"**기간:** {team.start_date} ~ {team.end_date}")
-    st.write(f"**시간:** {team.start_time.strftime('%H:%M')} ~ {team.end_time.strftime('%H:%M')} / {team.slot_minutes}분 단위")
-    st.write("**필수 파트 조건**")
-    st.write(", ".join(f"{part} {count}명" for part, count in team.required_parts.items() if count > 0) or "없음")
-
-
-def check_setup() -> bool:
-    if get_gas_url():
-        return True
-    st.error("Google Apps Script URL이 아직 설정되지 않았습니다.")
-    st.markdown(
-        """
-Streamlit Cloud의 앱 관리 화면에서 **Settings → Secrets**에 아래 형식으로 값을 추가해 주세요.
-
-```toml
-GAS_WEB_APP_URL = "https://script.google.com/macros/s/여기에_웹앱_URL/exec"
-```
-"""
-    )
-    return False
-
-
-# -----------------------------
-# Pages
-# -----------------------------
-def page_create_team() -> None:
-    st.header("1. 팀 만들기")
-    st.caption("운영진이 팀 정보를 입력하면 팀원 제출 링크와 결과 확인 링크가 생성됩니다.")
-
-    with st.form("create_team_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            name = st.text_input("팀명", placeholder="예: 2026 봄 정기공연 A팀")
-            songs = st.text_area("곡명", placeholder="예: Ditto\nSupernova")
-            members_raw = st.text_area(
-                "팀원 명단",
-                placeholder="한 줄에 한 명씩 입력\n서영\n민지\n지훈",
-                help="이 명단을 기준으로 미제출자를 자동 확인합니다.",
-            )
-        with col2:
-            start_date = st.date_input("시작 날짜", value=date.today())
-            end_date = st.date_input("종료 날짜", value=date.today() + timedelta(days=7))
-            start_time = st.time_input("하루 시작 시간", value=time(18, 0), step=1800)
-            end_time = st.time_input("하루 종료 시간", value=time(22, 0), step=1800)
-            slot_minutes = st.selectbox("시간 단위", [30, 60], index=1)
-
-        st.markdown("#### 필수 파트 조건")
-        st.caption("합주가 성립하려면 필요한 최소 인원을 설정하세요. 곡에 따라 0명으로 조정할 수 있습니다.")
-        required_parts: Dict[str, int] = {}
-        part_cols = st.columns(4)
-        for idx, part in enumerate(PARTS):
-            with part_cols[idx % 4]:
-                required_parts[part] = st.number_input(
-                    part,
-                    min_value=0,
-                    max_value=5,
-                    value=DEFAULT_REQUIRED_PARTS.get(part, 0),
-                    step=1,
-                )
-
-        submitted = st.form_submit_button("팀 생성", type="primary")
-
-    if submitted:
-        members = [line.strip() for line in members_raw.splitlines() if line.strip()]
-        if not name.strip():
-            st.error("팀명을 입력해 주세요.")
-            return
-        if not members:
-            st.error("팀원 명단을 최소 1명 이상 입력해 주세요.")
-            return
-        if end_date < start_date:
-            st.error("종료 날짜는 시작 날짜보다 빠를 수 없습니다.")
-            return
-        if end_time <= start_time:
-            st.error("종료 시간은 시작 시간보다 늦어야 합니다.")
-            return
-
-        try:
-            team_id = create_team(name, songs, members, start_date, end_date, start_time, end_time, slot_minutes, required_parts)
-        except Exception as exc:
-            st.error(f"팀 생성 중 오류가 발생했습니다: {exc}")
-            return
-
-        links = build_links(team_id)
-        st.success("팀이 생성되었습니다!")
-        st.write(f"**팀 ID:** `{team_id}`")
-        st.markdown("#### 팀원에게 보낼 제출 링크")
-        st.code(links["제출 링크"])
-        st.markdown("#### 운영진 결과 확인 링크")
-        st.code(links["결과 링크"])
-        st.info("이제 위 제출 링크를 팀원들에게 공유하면 됩니다.")
-
-
-def page_submit() -> None:
-    st.header("2. 가능 시간 제출")
-    team_id = get_query_param("team") or st.text_input("팀 ID 입력")
-    if not team_id:
-        st.warning("팀 링크로 접속하거나 팀 ID를 입력해 주세요.")
-        return
-
-    team = get_team(team_id)
-    if not team:
-        st.error("해당 팀을 찾을 수 없습니다. 링크 또는 팀 ID를 확인해 주세요.")
-        return
-
-    show_team_summary(team)
-    slots = generate_slots(team)
-
-    st.markdown("---")
-    member_name = st.selectbox("이름", [""] + team.members)
-    part = st.selectbox("파트", PARTS)
-
-    st.markdown("#### 가능한 시간을 체크해 주세요")
-    st.caption("휴대폰에서도 보기 쉽도록 날짜별로 시간을 선택할 수 있게 만들었습니다. PC에서는 격자형 보기로 바꿀 수도 있습니다.")
-
+def build_slot_maps(period: SchedulePeriod) -> Tuple[List[str], List[str], Dict[Tuple[str, str], str], Dict[str, Dict[str, object]]]:
     date_labels: List[str] = []
     time_labels: List[str] = []
-    slot_map: Dict[tuple, str] = {}
-
-    for slot in slots:
+    cell_map: Dict[Tuple[str, str], str] = {}
+    by_id: Dict[str, Dict[str, object]] = {}
+    for slot in generate_slots(period):
         date_label = str(slot["date_label"])
         time_label = str(slot["time_label"])
         if date_label not in date_labels:
             date_labels.append(date_label)
         if time_label not in time_labels:
             time_labels.append(time_label)
-        slot_map[(date_label, time_label)] = str(slot["id"])
+        slot_id = str(slot["id"])
+        cell_map[(date_label, time_label)] = slot_id
+        by_id[slot_id] = slot
+    return date_labels, time_labels, cell_map, by_id
 
-    selected_slots: List[str] = []
 
-    if not date_labels or not time_labels:
-        st.error("선택 가능한 시간대가 없습니다. 팀 생성 시 날짜와 시간을 다시 확인해 주세요.")
-        return
+def analyze_team_slots(
+    period: SchedulePeriod,
+    team: Team,
+    members: Sequence[Member],
+    schedules: Dict[str, PersonalSchedule],
+) -> List[Dict[str, object]]:
+    member_by_id = {m.id: m for m in members}
+    team_member_ids = [mid for mid in team.member_ids if mid in member_by_id]
+    selected_sets: Dict[str, Set[str]] = {
+        mid: set(schedules[mid].selected_slots) if mid in schedules else set()
+        for mid in team_member_ids
+    }
 
-    view_mode = st.radio(
-        "보기 방식",
-        ["모바일 친화형", "PC 격자형"],
-        horizontal=True,
-        help="휴대폰에서는 모바일 친화형을 추천합니다. PC에서는 격자형이 한눈에 보기 좋습니다.",
+    rows: List[Dict[str, object]] = []
+    for slot in generate_slots(period):
+        slot_id = str(slot["id"])
+        available_ids = [mid for mid in team_member_ids if slot_id in selected_sets[mid]]
+        unavailable_ids = [mid for mid in team_member_ids if mid not in available_ids]
+
+        part_counts: Dict[str, int] = {part: 0 for part in PARTS}
+        for mid in available_ids:
+            part = member_by_id[mid].part
+            part_counts[part] = part_counts.get(part, 0) + 1
+
+        missing_parts: List[str] = []
+        for part, required in team.required_parts.items():
+            shortage = max(0, int(required) - part_counts.get(part, 0))
+            if shortage:
+                missing_parts.append(f"{part} {shortage}명")
+
+        rows.append({
+            "slot_id": slot_id,
+            "date": slot["date"],
+            "date_label": slot["date_label"],
+            "start": slot["start"],
+            "end": slot["end"],
+            "time_label": slot["time_label"],
+            "available_ids": available_ids,
+            "unavailable_ids": unavailable_ids,
+            "available_count": len(available_ids),
+            "total_count": len(team_member_ids),
+            "unavailable_names": [member_by_id[mid].name for mid in unavailable_ids],
+            "part_ok": not missing_parts,
+            "missing_parts": missing_parts,
+        })
+    return rows
+
+
+def group_rehearsal_blocks(rows: Sequence[Dict[str, object]], max_absent: int = 0) -> List[Dict[str, object]]:
+    """Group consecutive slots only when the same people are unavailable and part status matches."""
+    eligible = [
+        row for row in rows
+        if len(row["unavailable_ids"]) <= max_absent and bool(row["part_ok"])
+    ]
+    if not eligible:
+        return []
+
+    blocks: List[Dict[str, object]] = []
+    current: Optional[Dict[str, object]] = None
+
+    for row in eligible:
+        signature = tuple(sorted(str(mid) for mid in row["unavailable_ids"]))
+        if (
+            current
+            and current["date"] == row["date"]
+            and current["end"] == row["start"]
+            and current["signature"] == signature
+        ):
+            current["end"] = row["end"]
+            current["slot_ids"].append(row["slot_id"])
+        else:
+            if current:
+                blocks.append(current)
+            current = {
+                "date": row["date"],
+                "date_label": row["date_label"],
+                "start": row["start"],
+                "end": row["end"],
+                "unavailable_names": list(row["unavailable_names"]),
+                "signature": signature,
+                "slot_ids": [row["slot_id"]],
+                "total_count": row["total_count"],
+            }
+    if current:
+        blocks.append(current)
+
+    for block in blocks:
+        minutes = int((block["end"] - block["start"]).total_seconds() // 60)
+        block["minutes"] = minutes
+        block["label"] = f"{block['start'].strftime('%H:%M')}~{block['end'].strftime('%H:%M')}"
+    return blocks
+
+
+def get_missing_submitters(team: Team, members: Sequence[Member], schedules: Dict[str, PersonalSchedule]) -> List[str]:
+    member_by_id = {m.id: m for m in members}
+    return [member_by_id[mid].name for mid in team.member_ids if mid in member_by_id and mid not in schedules]
+
+
+def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+# -----------------------------------------------------------------------------
+# UI helpers
+# -----------------------------------------------------------------------------
+def check_setup() -> bool:
+    if get_gas_url():
+        return True
+    st.error("Google Apps Script URL이 설정되지 않았습니다.")
+    st.code('GAS_WEB_APP_URL = "https://script.google.com/macros/s/.../exec"')
+    return False
+
+
+def require_admin() -> bool:
+    expected = get_admin_pin()
+    if not expected:
+        st.warning("ADMIN_PIN이 설정되지 않아 현재 임원진 메뉴가 잠금 없이 열려 있습니다.")
+        return True
+    entered = st.text_input("임원진 PIN", type="password")
+    if not entered:
+        return False
+    if entered != expected:
+        st.error("PIN이 올바르지 않습니다.")
+        return False
+    return True
+
+
+def show_period_summary(period: SchedulePeriod) -> None:
+    st.caption(
+        f"{period.name} · {period.start_date.strftime('%Y.%m.%d')} ~ {period.end_date.strftime('%Y.%m.%d')} · "
+        f"{period.start_time.strftime('%H:%M')}~{period.end_time.strftime('%H:%M')} · {period.slot_minutes}분 단위"
     )
 
-    if view_mode == "모바일 친화형":
-        st.info("날짜별로 가능한 시간을 여러 개 선택하세요. 휴대폰 화면에서 가장 안정적으로 보이는 방식입니다.")
+
+def render_schedule_picker(period: SchedulePeriod, member: Member, existing: Set[str]) -> List[str]:
+    date_labels, time_labels, cell_map, _ = build_slot_maps(period)
+    selected: List[str] = []
+
+    mode = st.radio("보기 방식", ["모바일 친화형", "PC 격자형"], horizontal=True)
+    if mode == "모바일 친화형":
         for date_label in date_labels:
-            day_time_labels = [time_label for time_label in time_labels if (date_label, time_label) in slot_map]
-            chosen_times = st.multiselect(
-                f"{date_label}",
-                options=day_time_labels,
-                key=f"mobile_{team.id}_{member_name}_{part}_{date_label}",
-                placeholder="가능한 시간을 선택하세요",
+            day_times = [t for t in time_labels if (date_label, t) in cell_map]
+            defaults = [t for t in day_times if cell_map[(date_label, t)] in existing]
+            chosen = st.multiselect(
+                date_label,
+                options=day_times,
+                default=defaults,
+                key=f"mobile_{period.id}_{member.id}_{date_label}",
             )
-            for time_label in chosen_times:
-                selected_slots.append(slot_map[(date_label, time_label)])
-
+            selected.extend(cell_map[(date_label, t)] for t in chosen)
     else:
-        st.caption("날짜가 많으면 주차별 탭으로 나누어 보여줍니다.")
-
-        def chunk_list(items: List[str], size: int) -> List[List[str]]:
-            return [items[i : i + size] for i in range(0, len(items), size)]
-
-        date_chunks = chunk_list(date_labels, 5)
-        tab_labels = []
-        for idx, chunk in enumerate(date_chunks, start=1):
-            if len(chunk) == 1:
-                tab_labels.append(chunk[0])
-            else:
-                tab_labels.append(f"{idx}주차: {chunk[0]} ~ {chunk[-1]}")
-
-        tabs = st.tabs(tab_labels)
-
-        for tab, chunk in zip(tabs, date_chunks):
+        chunks = [date_labels[i:i + 5] for i in range(0, len(date_labels), 5)]
+        tabs = st.tabs([
+            chunk[0] if len(chunk) == 1 else f"{idx + 1}주차: {chunk[0]} ~ {chunk[-1]}"
+            for idx, chunk in enumerate(chunks)
+        ])
+        for tab, chunk in zip(tabs, chunks):
             with tab:
-                header_cols = st.columns([1.5] + [1 for _ in chunk])
-                with header_cols[0]:
-                    st.markdown("**시간**")
-                for idx, date_label in enumerate(chunk, start=1):
-                    with header_cols[idx]:
-                        st.markdown(f"**{date_label}**")
-
-                for time_label in time_labels:
-                    row_cols = st.columns([1.5] + [1 for _ in chunk])
-                    with row_cols[0]:
-                        st.markdown(f"**{time_label}**")
-                    for idx, date_label in enumerate(chunk, start=1):
-                        slot_id = slot_map.get((date_label, time_label))
-                        with row_cols[idx]:
-                            if slot_id:
-                                checked = st.checkbox(
-                                    "가능",
-                                    key=f"grid_{team.id}_{member_name}_{part}_{slot_id}",
-                                    label_visibility="collapsed",
-                                )
-                                if checked:
-                                    selected_slots.append(slot_id)
-                            else:
-                                st.write("-")
-
-    submitted = st.button("제출하기", type="primary")
-
-    if submitted:
-        if not member_name:
-            st.error("이름을 선택해 주세요.")
-            return
-        if not selected_slots:
-            st.error("가능한 시간을 최소 1개 이상 선택해 주세요.")
-            return
-        try:
-            save_response(team.id, member_name, part, selected_slots)
-        except Exception as exc:
-            st.error(f"제출 중 오류가 발생했습니다: {exc}")
-            return
-        st.success("제출 완료! 같은 이름으로 다시 제출하면 기존 응답이 수정됩니다.")
+                headers = st.columns([1.4] + [1] * len(chunk))
+                headers[0].markdown("**시간**")
+                for idx, dlabel in enumerate(chunk, start=1):
+                    headers[idx].markdown(f"**{dlabel}**")
+                for tlabel in time_labels:
+                    cols = st.columns([1.4] + [1] * len(chunk))
+                    cols[0].markdown(f"**{tlabel}**")
+                    for idx, dlabel in enumerate(chunk, start=1):
+                        sid = cell_map.get((dlabel, tlabel))
+                        if not sid:
+                            cols[idx].write("-")
+                            continue
+                        checked = cols[idx].checkbox(
+                            "가능",
+                            value=sid in existing,
+                            key=f"grid_{period.id}_{member.id}_{sid}",
+                            label_visibility="collapsed",
+                        )
+                        if checked:
+                            selected.append(sid)
+    return selected
 
 
-def page_result() -> None:
-    st.header("3. 결과 보기")
-    team_id = get_query_param("team") or st.text_input("팀 ID 입력")
-    if not team_id:
-        st.warning("결과 링크로 접속하거나 팀 ID를 입력해 주세요.")
+def render_date_blocks(blocks: Sequence[Dict[str, object]], max_absent: int) -> None:
+    if not blocks:
+        st.info("조건에 맞는 연속 가능 시간이 없습니다.")
         return
+    by_date: Dict[str, List[Dict[str, object]]] = {}
+    for block in blocks:
+        by_date.setdefault(str(block["date_label"]), []).append(block)
 
-    team = get_team(team_id)
-    if not team:
-        st.error("해당 팀을 찾을 수 없습니다. 링크 또는 팀 ID를 확인해 주세요.")
-        return
-
-    show_team_summary(team)
-    responses = get_responses(team.id)
-    results = analyze_availability(team, responses)
-    missing_members = get_missing_members(team, responses)
-    notice = make_notice(team, responses, results, missing_members)
-
-    st.markdown("#### 제출 현황")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("전체 팀원", f"{len(team.members)}명")
-    col2.metric("제출 인원", f"{len(responses)}명")
-    col3.metric("미제출", f"{len(missing_members)}명")
-    satisfied_count = sum(1 for row in results if row["파트 충족"] == "충족")
-    col4.metric("파트 충족 시간대", f"{satisfied_count}개")
-
-    if missing_members:
-        st.warning("미제출자: " + ", ".join(missing_members))
-    else:
-        st.success("모든 팀원이 제출했습니다.")
-
-    st.markdown("#### 운영진 공지용 요약")
-    st.text_area("단톡방에 복사해서 보낼 수 있는 문장", value=notice, height=180)
-
-    st.markdown("#### 추천 기준")
-    st.info("추천 점수 = 가능 인원×10점 + 필수 파트 충족 50점 + 저녁 시간대 가중치 최대 10점")
-
-    st.markdown("#### 추천 합주 시간")
-    st.dataframe(results, use_container_width=True, hide_index=True)
-
-    st.markdown("#### 제출자 목록")
-    rows = response_rows(responses)
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    st.markdown("#### 다운로드")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.download_button(
-            "추천 결과 CSV 다운로드",
-            data=to_csv_bytes(results),
-            file_name=f"{team.name}_추천결과.csv",
-            mime="text/csv",
-        )
-    with col_b:
-        st.download_button(
-            "제출 현황 CSV 다운로드",
-            data=to_csv_bytes(rows),
-            file_name=f"{team.name}_제출현황.csv",
-            mime="text/csv",
-        )
+    for date_label, day_blocks in by_date.items():
+        st.markdown(f"#### {date_label}")
+        for block in day_blocks:
+            minutes = int(block["minutes"])
+            duration = f"{minutes // 60}시간" if minutes % 60 == 0 else f"{minutes}분"
+            unavailable = list(block["unavailable_names"])
+            if not unavailable:
+                st.success(f"{block['label']} · {duration} · 전원 가능")
+            else:
+                st.warning(f"{block['label']} · {duration} · 불가능: {', '.join(unavailable)}")
 
 
-def page_team_list() -> None:
-    st.header("팀 목록")
+# -----------------------------------------------------------------------------
+# Pages
+# -----------------------------------------------------------------------------
+def page_my_schedule(period: SchedulePeriod) -> None:
+    st.header("🙋 내 스케줄 입력")
+    show_period_summary(period)
+
     try:
-        teams = list_teams()
+        members = list_members(active_only=True)
     except Exception as exc:
-        st.error(f"팀 목록을 불러오는 중 오류가 발생했습니다: {exc}")
+        st.error(f"부원 명단을 불러오지 못했습니다: {exc}")
+        return
+    if not members:
+        st.info("등록된 부원이 없습니다. 임원진 메뉴에서 부원을 먼저 등록해 주세요.")
         return
 
+    label_to_member = {f"{m.name} · {m.part}": m for m in members}
+    choice = st.selectbox("이름", [""] + list(label_to_member.keys()))
+    if not choice:
+        st.info("본인 이름을 선택하면 기존 스케줄을 불러옵니다.")
+        return
+    member = label_to_member[choice]
+
+    try:
+        existing_schedule = get_personal_schedule(period.id, member.id)
+    except Exception as exc:
+        st.error(f"기존 스케줄을 불러오지 못했습니다: {exc}")
+        return
+    existing = set(existing_schedule.selected_slots) if existing_schedule else set()
+    if existing_schedule:
+        st.caption("기존 제출 내용을 불러왔습니다. 체크를 바꾸고 다시 저장하면 수정됩니다.")
+
+    selected = render_schedule_picker(period, member, existing)
+    if st.button("스케줄 저장", type="primary"):
+        try:
+            save_personal_schedule(period.id, member.id, selected)
+        except Exception as exc:
+            st.error(f"저장 중 오류가 발생했습니다: {exc}")
+            return
+        st.success(f"저장되었습니다. 가능한 시간 {len(selected)}개가 선택되어 있습니다.")
+
+
+def page_team_schedule(period: SchedulePeriod) -> None:
+    st.header("🎸 팀별 스케줄")
+    show_period_summary(period)
+    try:
+        teams = list_teams(period.id)
+    except Exception as exc:
+        st.error(f"팀 목록을 불러오지 못했습니다: {exc}")
+        return
     if not teams:
         st.info("아직 생성된 팀이 없습니다.")
         return
 
-    for team in teams:
-        with st.container(border=True):
-            st.markdown(f"### {team.name}")
-            st.write(f"팀 ID: `{team.id}`")
-            st.write(f"기간: {team.start_date} ~ {team.end_date}")
-            links = build_links(team.id)
-            st.write("제출 링크")
-            st.code(links["제출 링크"])
-            st.write("결과 링크")
-            st.code(links["결과 링크"])
+    team_labels = {f"{t.name}{' · ' + t.songs if t.songs else ''}": t for t in teams}
+    selected_label = st.selectbox("팀 선택", list(team_labels.keys()))
+    team = team_labels[selected_label]
+
+    try:
+        team, members, schedules = get_team_bundle(team.id)
+    except Exception as exc:
+        st.error(f"팀 데이터를 불러오지 못했습니다: {exc}")
+        return
+    if not team:
+        st.error("팀 정보를 찾을 수 없습니다.")
+        return
+
+    member_by_id = {m.id: m for m in members}
+    st.write("**팀원:** " + ", ".join(f"{member_by_id[mid].name}({member_by_id[mid].part})" for mid in team.member_ids if mid in member_by_id))
+
+    missing = get_missing_submitters(team, members, schedules)
+    if missing:
+        st.warning("개인 스케줄 미제출: " + ", ".join(missing))
+    else:
+        st.success("모든 팀원이 개인 스케줄을 제출했습니다.")
+
+    rows = analyze_team_slots(period, team, members, schedules)
+    max_absent = st.radio(
+        "날짜별 가능시간 표시 기준",
+        [0, 1],
+        format_func=lambda n: "전원 가능만 보기" if n == 0 else "1명 불참까지 포함",
+        horizontal=True,
+    )
+    blocks = group_rehearsal_blocks(rows, max_absent=max_absent)
+
+    st.markdown("### 날짜별 연속 가능시간")
+    render_date_blocks(blocks, max_absent)
+
+    st.markdown("### 전체 시간표")
+    table_rows = []
+    for row in rows:
+        table_rows.append({
+            "날짜": row["date_label"],
+            "시간": row["time_label"],
+            "가능 인원": f"{row['available_count']}/{row['total_count']}",
+            "불가능": ", ".join(row["unavailable_names"]) or "-",
+            "파트": "충족" if row["part_ok"] else "부족",
+            "부족 파트": ", ".join(row["missing_parts"]) or "-",
+        })
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
 
-# -----------------------------
-# App
-# -----------------------------
+def page_admin(period: Optional[SchedulePeriod]) -> None:
+    st.header("⚙️ 임원진 관리")
+    if not require_admin():
+        return
+
+    tab_period, tab_members, tab_teams, tab_final = st.tabs(["일정 기간", "부원 관리", "팀 관리", "합주 확정"])
+
+    with tab_period:
+        st.subheader("일정 기간 설정")
+        st.caption("새 기간을 저장하면 새 schedule_id가 생성되어 이전 제출과 섞이지 않습니다.")
+        with st.form("period_form"):
+            name = st.text_input("일정 이름", value=period.name if period else "", placeholder="예: 2026 가을 정기공연")
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input("시작 날짜", value=period.start_date if period else date.today())
+                start_time = st.time_input("하루 시작 시간", value=period.start_time if period else time(18, 0), step=1800)
+            with col2:
+                end_date = st.date_input("종료 날짜", value=period.end_date if period else date.today() + timedelta(days=14))
+                end_time = st.time_input("하루 종료 시간", value=period.end_time if period else time(22, 0), step=1800)
+            slot_minutes = st.selectbox("시간 단위", [30, 60], index=0 if period and period.slot_minutes == 30 else 1)
+            save_clicked = st.form_submit_button("새 일정 기간으로 저장", type="primary")
+        if save_clicked:
+            if not name.strip():
+                st.error("일정 이름을 입력해 주세요.")
+            elif end_date < start_date:
+                st.error("종료 날짜가 시작 날짜보다 빠릅니다.")
+            elif end_time <= start_time:
+                st.error("종료 시간은 시작 시간보다 늦어야 합니다.")
+            else:
+                try:
+                    new_id = save_period(name, start_date, end_date, start_time, end_time, slot_minutes)
+                    st.success(f"새 일정 기간이 생성되었습니다. schedule_id: {new_id}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"저장 중 오류: {exc}")
+
+    with tab_members:
+        st.subheader("부원 등록")
+        st.caption("한 줄에 `이름,파트` 형식으로 여러 명을 한꺼번에 등록할 수 있습니다.")
+        bulk = st.text_area("부원 명단", placeholder="서영,건반\n민지,보컬\n지훈,드럼")
+        if st.button("부원 추가"):
+            rows: List[Dict[str, str]] = []
+            errors: List[str] = []
+            for idx, line in enumerate(bulk.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                pieces = [p.strip() for p in line.split(",", 1)]
+                if len(pieces) != 2 or not pieces[0]:
+                    errors.append(f"{idx}번째 줄")
+                    continue
+                part = pieces[1] if pieces[1] in PARTS else "기타/그 외"
+                rows.append({"name": pieces[0], "part": part})
+            if errors:
+                st.error("형식을 확인해 주세요: " + ", ".join(errors))
+            elif not rows:
+                st.error("추가할 부원을 입력해 주세요.")
+            else:
+                try:
+                    add_members(rows)
+                    st.success(f"{len(rows)}명을 추가했습니다.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"부원 추가 중 오류: {exc}")
+
+        try:
+            all_members = list_members(active_only=False)
+            st.dataframe([
+                {"이름": m.name, "파트": m.part, "활성": m.active, "member_id": m.id}
+                for m in all_members
+            ], use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error(f"부원 목록을 불러오지 못했습니다: {exc}")
+
+    with tab_teams:
+        if not period:
+            st.info("먼저 일정 기간을 설정해 주세요.")
+        else:
+            st.subheader("팀 생성")
+            try:
+                members = list_members(active_only=True)
+            except Exception as exc:
+                st.error(f"부원 목록을 불러오지 못했습니다: {exc}")
+                members = []
+            label_to_id = {f"{m.name} · {m.part}": m.id for m in members}
+            with st.form("team_form"):
+                team_name = st.text_input("팀명", placeholder="예: Ditto")
+                songs = st.text_area("곡명", placeholder="여러 곡이면 줄바꿈")
+                selected_member_labels = st.multiselect("팀원 선택", list(label_to_id.keys()))
+                st.markdown("#### 필수 파트 조건")
+                required_parts: Dict[str, int] = {}
+                cols = st.columns(4)
+                for idx, part in enumerate(PARTS):
+                    with cols[idx % 4]:
+                        required_parts[part] = st.number_input(
+                            part,
+                            min_value=0,
+                            max_value=5,
+                            value=DEFAULT_REQUIRED_PARTS.get(part, 0),
+                            step=1,
+                            key=f"req_{part}",
+                        )
+                create_clicked = st.form_submit_button("팀 생성", type="primary")
+            if create_clicked:
+                member_ids = [label_to_id[label] for label in selected_member_labels]
+                if not team_name.strip():
+                    st.error("팀명을 입력해 주세요.")
+                elif not member_ids:
+                    st.error("팀원을 한 명 이상 선택해 주세요.")
+                else:
+                    try:
+                        team_id = create_team(period.id, team_name, songs, member_ids, required_parts)
+                        st.success(f"팀이 생성되었습니다. team_id: {team_id}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"팀 생성 중 오류: {exc}")
+
+            st.subheader("현재 팀")
+            try:
+                teams = list_teams(period.id)
+                for t in teams:
+                    with st.container(border=True):
+                        col_a, col_b = st.columns([5, 1])
+                        col_a.markdown(f"**{t.name}**" + (f" · {t.songs}" if t.songs else ""))
+                        if col_b.button("삭제", key=f"delete_team_{t.id}"):
+                            delete_team(t.id)
+                            st.rerun()
+            except Exception as exc:
+                st.error(f"팀 목록 오류: {exc}")
+
+    with tab_final:
+        if not period:
+            st.info("먼저 일정 기간을 설정해 주세요.")
+        else:
+            st.subheader("합주시간 확정")
+            try:
+                teams = list_teams(period.id)
+            except Exception as exc:
+                st.error(f"팀 목록 오류: {exc}")
+                teams = []
+
+            if teams:
+                team_labels = {t.name: t for t in teams}
+                team_name = st.selectbox("팀", list(team_labels.keys()), key="final_team")
+                selected_team = team_labels[team_name]
+                try:
+                    t, members, schedules = get_team_bundle(selected_team.id)
+                except Exception as exc:
+                    st.error(f"팀 데이터 오류: {exc}")
+                    t, members, schedules = None, [], {}
+                if t:
+                    rows = analyze_team_slots(period, t, members, schedules)
+                    blocks = group_rehearsal_blocks(rows, max_absent=0)
+                    if blocks:
+                        block_labels = {
+                            f"{b['date_label']} {b['label']} ({int(b['minutes']) // 60}시간 {int(b['minutes']) % 60}분)": b
+                            for b in blocks
+                        }
+                        chosen_label = st.selectbox("전원 가능한 연속 시간", list(block_labels.keys()))
+                        b = block_labels[chosen_label]
+                        if st.button("이 시간으로 합주 확정", type="primary"):
+                            try:
+                                save_final_schedule(period.id, t.id, b["start"], b["end"])
+                                st.success("합주시간을 확정했습니다.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"확정 저장 오류: {exc}")
+                    else:
+                        st.info("전원이 가능한 연속 시간이 없습니다.")
+
+            st.subheader("확정된 전체 합주표")
+            try:
+                finals = list_final_schedules(period.id)
+                team_by_id = {t.id: t for t in teams}
+                final_rows = []
+                for f in finals:
+                    start_dt = datetime.fromisoformat(str(f["start_dt"]))
+                    end_dt = datetime.fromisoformat(str(f["end_dt"]))
+                    team_obj = team_by_id.get(str(f["team_id"]))
+                    final_rows.append({
+                        "final_id": str(f.get("final_id", "")),
+                        "날짜": f"{start_dt.strftime('%m/%d')}({weekday_kr(start_dt.date())})",
+                        "시간": f"{start_dt.strftime('%H:%M')}~{end_dt.strftime('%H:%M')}",
+                        "팀": team_obj.name if team_obj else str(f["team_id"]),
+                        "team_id": str(f["team_id"]),
+                        "start": start_dt,
+                        "end": end_dt,
+                    })
+                st.dataframe([
+                    {"날짜": r["날짜"], "시간": r["시간"], "팀": r["팀"]}
+                    for r in final_rows
+                ], use_container_width=True, hide_index=True)
+
+                # member-level conflict detection
+                conflicts: List[str] = []
+                member_names = {m.id: m.name for m in list_members(active_only=False)}
+                for i in range(len(final_rows)):
+                    for j in range(i + 1, len(final_rows)):
+                        a, b = final_rows[i], final_rows[j]
+                        if not overlap(a["start"], a["end"], b["start"], b["end"]):
+                            continue
+                        ta = team_by_id.get(a["team_id"])
+                        tb = team_by_id.get(b["team_id"])
+                        if not ta or not tb:
+                            continue
+                        shared = set(ta.member_ids) & set(tb.member_ids)
+                        for mid in shared:
+                            conflicts.append(f"{member_names.get(mid, mid)}: {a['팀']} ↔ {b['팀']} ({a['날짜']})")
+                if conflicts:
+                    st.error("합주시간 중복이 있습니다.\n\n" + "\n\n".join(f"• {c}" for c in conflicts))
+                elif final_rows:
+                    st.success("현재 확정 합주 간 팀원 시간 중복이 없습니다.")
+            except Exception as exc:
+                st.error(f"확정 합주표를 불러오지 못했습니다: {exc}")
+
+
 def main() -> None:
-    st.set_page_config(page_title="밴드부 합주 일정 조율", page_icon="🎸", layout="wide")
-
-    st.title("🎸 밴드부 합주 일정 조율")
-    st.caption("팀별 링크로 가능 시간을 수집하고, 파트 충족 여부와 최적 합주 시간을 자동으로 계산합니다.")
-
-    page_from_url = get_query_param("page", "create")
-    page_options = {
-        "create": "팀 만들기",
-        "submit": "가능 시간 제출",
-        "result": "결과 보기",
-        "list": "팀 목록",
-    }
-    reverse_options = {label: key for key, label in page_options.items()}
-
-    default_label = page_options.get(page_from_url, "팀 만들기")
-    with st.sidebar:
-        selected_label = st.radio(
-            "메뉴",
-            list(reverse_options.keys()),
-            index=list(reverse_options.keys()).index(default_label),
-        )
-        selected_page = reverse_options[selected_label]
-        st.divider()
-        st.write("데이터는 Google Sheets에 저장됩니다.")
+    st.set_page_config(page_title="밴드부 합주 일정", page_icon="🎸", layout="wide")
+    st.title("🎸 밴드부 합주 일정")
+    st.caption("개인 스케줄을 한 번 입력하고, 팀별 가능시간을 자동으로 계산합니다.")
 
     if not check_setup():
         return
 
-    if selected_page == "create":
-        page_create_team()
-    elif selected_page == "submit":
-        page_submit()
-    elif selected_page == "result":
-        page_result()
-    elif selected_page == "list":
-        page_team_list()
+    try:
+        period = get_current_period()
+    except Exception as exc:
+        st.error(f"현재 일정 기간을 불러오지 못했습니다: {exc}")
+        return
+
+    menu = st.sidebar.radio("메뉴", ["내 스케줄 입력", "팀별 스케줄", "임원진 관리"])
+    st.sidebar.divider()
+    if period:
+        st.sidebar.caption(f"현재 일정: {period.name}")
+    else:
+        st.sidebar.warning("현재 일정 기간이 없습니다.")
+
+    if menu == "임원진 관리":
+        page_admin(period)
+        return
+
+    if not period:
+        st.info("임원진이 먼저 일정 기간을 설정해야 합니다.")
+        return
+
+    if menu == "내 스케줄 입력":
+        page_my_schedule(period)
+    elif menu == "팀별 스케줄":
+        page_team_schedule(period)
 
 
 if __name__ == "__main__":
