@@ -589,16 +589,10 @@ def render_schedule_picker(
     period: SchedulePeriod,
     widget_key: str,
     existing: Set[str],
+    mode: str,
 ) -> List[str]:
     date_labels, time_labels, slot_map = build_slot_maps(period)
     selected: List[str] = []
-
-    mode = st.radio(
-        "보기 방식",
-        ["모바일 친화형", "PC 격자형"],
-        horizontal=True,
-        key=f"view_{widget_key}",
-    )
 
     if mode == "모바일 친화형":
         for date_label in date_labels:
@@ -646,7 +640,6 @@ def render_schedule_picker(
 
     return selected
 
-
 def duration_text(minutes: int) -> str:
     if minutes < 60:
         return f"{minutes}분"
@@ -685,10 +678,10 @@ def page_my_schedule(period: SchedulePeriod) -> None:
     show_period_summary(period)
     st.caption(
         "이름을 먼저 확인한 뒤 파트와 가능한 시간을 입력해 주세요. "
-        "이름을 타이핑할 때마다 Google Sheets를 다시 읽지 않도록 바꾼 빠른 입력 방식입니다."
+        "가능 시간은 날짜별로 모두 고른 뒤 마지막 저장 버튼을 눌렀을 때 한 번에 저장됩니다."
     )
 
-    # 이름 입력만으로는 조회하지 않고, 확인 버튼을 눌렀을 때 한 번만 조회한다.
+    # 이름 조회는 확인 버튼을 눌렀을 때만 실행한다.
     with st.form("member_lookup_form", clear_on_submit=False):
         typed_name = st.text_input(
             "이름(풀네임)",
@@ -726,7 +719,6 @@ def page_my_schedule(period: SchedulePeriod) -> None:
 
     member_id = st.session_state.get("confirmed_member_id", "")
 
-    # 캐시 덕분에 여기부터는 체크박스를 눌러 재실행되어도 네트워크 요청이 거의 발생하지 않는다.
     try:
         members = list_members(active_only=True)
     except Exception as exc:
@@ -760,23 +752,47 @@ def page_my_schedule(period: SchedulePeriod) -> None:
         widget_key = f"new_{name_key}"
         existing_slots = set()
 
-    selected_parts = st.multiselect(
-        "가능한 파트 (여러 개 선택 가능)",
-        options=part_options,
-        default=default_parts,
-        key=part_key,
-        placeholder="본인이 맡을 수 있는 파트를 모두 선택하세요",
+    # 보기 방식 변경은 화면 구조가 달라지므로 이 선택에서만 한 번 재실행된다.
+    # 실제 파트/가능시간 입력은 아래 form 안에 있어 날짜를 바꿔 입력해도 재실행되지 않는다.
+    view_mode = st.radio(
+        "보기 방식",
+        ["모바일 친화형", "PC 격자형"],
+        horizontal=True,
+        key=f"view_{period.id}_{widget_key}",
     )
 
-    if not selected_parts:
-        st.warning("파트를 한 개 이상 선택해 주세요.")
-        return
+    with st.form(
+        f"schedule_entry_form_{period.id}_{widget_key}",
+        clear_on_submit=False,
+    ):
+        selected_parts = st.multiselect(
+            "가능한 파트 (여러 개 선택 가능)",
+            options=part_options,
+            default=default_parts,
+            key=part_key,
+            placeholder="본인이 맡을 수 있는 파트를 모두 선택하세요",
+        )
 
-    st.markdown("### 가능한 시간")
-    st.caption("가능한 시간이 하나도 없으면 아무것도 체크하지 않고 저장해도 됩니다.")
-    selected_slots = render_schedule_picker(period, widget_key, existing_slots)
+        st.markdown("### 가능한 시간")
+        st.caption(
+            "날짜별 시간을 전부 선택해도 중간에는 서버로 저장되지 않습니다. "
+            "맨 아래 **내 스케줄 저장**을 눌렀을 때 한 번에 저장됩니다."
+        )
 
-    if st.button("내 스케줄 저장", type="primary"):
+        selected_slots = render_schedule_picker(
+            period,
+            widget_key,
+            existing_slots,
+            view_mode,
+        )
+
+        save_clicked = st.form_submit_button("내 스케줄 저장", type="primary")
+
+    if save_clicked:
+        if not selected_parts:
+            st.error("파트를 한 개 이상 선택해 주세요.")
+            return
+
         try:
             saved = save_member_and_schedule(
                 period.id,
@@ -794,7 +810,6 @@ def page_my_schedule(period: SchedulePeriod) -> None:
             f"저장되었습니다! {saved.name} · "
             f"파트: {', '.join(saved.parts)} · 가능 시간 {len(selected_slots)}개"
         )
-
 
 def page_team_schedule(period: SchedulePeriod) -> None:
     st.header("🎸 팀별 스케줄")
@@ -1016,8 +1031,12 @@ def page_admin(period: Optional[SchedulePeriod]) -> None:
                     for m in members
                 }
 
-                team_name = st.text_input("팀명", placeholder="예: Ditto", key="team_name")
-                songs = st.text_area("곡명", placeholder="여러 곡이면 줄바꿈", key="team_songs")
+                song_name = st.text_input(
+                    "곡명",
+                    placeholder="예: Ditto",
+                    key="team_song_name",
+                    help="입력한 곡명이 그대로 팀 이름으로 사용됩니다.",
+                )
                 selected_labels = st.multiselect(
                     "팀원 선택",
                     options=list(label_to_member.keys()),
@@ -1042,13 +1061,14 @@ def page_admin(period: Optional[SchedulePeriod]) -> None:
                         member_roles[member.id] = role
 
                 if st.button("팀 생성", type="primary", key="create_team_button"):
-                    if not team_name.strip():
-                        st.error("팀명을 입력해 주세요.")
+                    if not song_name.strip():
+                        st.error("곡명을 입력해 주세요.")
                     elif not member_roles:
                         st.error("팀원을 한 명 이상 선택해 주세요.")
                     else:
                         try:
-                            create_team(period.id, team_name, songs, member_roles)
+                            # 곡명 자체를 팀 이름으로 사용한다. songs 컬럼은 새 팀에서는 비워 둔다.
+                            create_team(period.id, song_name.strip(), "", member_roles)
                             st.success("팀이 생성되었습니다.")
                             st.rerun()
                         except Exception as exc:
@@ -1064,6 +1084,7 @@ def page_admin(period: Optional[SchedulePeriod]) -> None:
             for team_item in teams:
                 with st.container(border=True):
                     col_a, col_b = st.columns([5, 1])
+                    # 새 팀은 곡명 자체가 팀 이름이다. 예전 팀 데이터의 songs 값은 호환을 위해서만 표시한다.
                     title = team_item.name + (f" · {team_item.songs}" if team_item.songs else "")
                     col_a.markdown(f"**{title}**")
 
