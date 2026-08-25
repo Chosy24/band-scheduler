@@ -14,7 +14,7 @@ PARTS = [
     "기타2",
     "베이스",
     "드럼",
-    "건반1",
+    "건반",
     "건반2",
     "기타/그 외",
 ]
@@ -77,16 +77,20 @@ def get_admin_pin() -> str:
         return ""
 
 
-def api_get(action: str, params: Optional[Dict[str, str]] = None) -> Dict[str, object]:
-    url = get_gas_url()
-    if not url:
-        raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
+@st.cache_resource
+def get_http_session() -> requests.Session:
+    """HTTP 연결을 재사용해서 Apps Script 왕복 비용을 줄인다."""
+    return requests.Session()
 
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _cached_api_get(url: str, action: str, params_json: str) -> Dict[str, object]:
+    """GET 결과를 잠깐 캐시해 Streamlit 재실행 때 중복 조회를 막는다."""
     query = {"action": action}
-    if params:
-        query.update(params)
+    if params_json:
+        query.update(json.loads(params_json))
 
-    response = requests.get(url, params=query, timeout=20)
+    response = get_http_session().get(url, params=query, timeout=20)
     response.raise_for_status()
     data = response.json()
     if not data.get("ok"):
@@ -94,16 +98,28 @@ def api_get(action: str, params: Optional[Dict[str, str]] = None) -> Dict[str, o
     return data
 
 
+def api_get(action: str, params: Optional[Dict[str, str]] = None) -> Dict[str, object]:
+    url = get_gas_url()
+    if not url:
+        raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
+
+    params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
+    return _cached_api_get(url, action, params_json)
+
+
 def api_post(payload: Dict[str, object]) -> Dict[str, object]:
     url = get_gas_url()
     if not url:
         raise RuntimeError("GAS_WEB_APP_URL이 설정되지 않았습니다.")
 
-    response = requests.post(url, json=payload, timeout=20)
+    response = get_http_session().post(url, json=payload, timeout=20)
     response.raise_for_status()
     data = response.json()
     if not data.get("ok"):
         raise RuntimeError(str(data.get("error", "Google Apps Script API 오류")))
+
+    # 저장/삭제 후에는 다음 조회가 최신 데이터를 가져오도록 GET 캐시만 비운다.
+    _cached_api_get.clear()
     return data
 
 
@@ -668,33 +684,62 @@ def page_my_schedule(period: SchedulePeriod) -> None:
     st.header("🙋 내 스케줄 입력")
     show_period_summary(period)
     st.caption(
-        "본인 풀네임과 맡을 수 있는 파트를 등록한 뒤 가능한 시간을 체크해 주세요. "
-        "처음 저장하면 부원 명단에도 자동으로 등록됩니다."
+        "이름을 먼저 확인한 뒤 파트와 가능한 시간을 입력해 주세요. "
+        "이름을 타이핑할 때마다 Google Sheets를 다시 읽지 않도록 바꾼 빠른 입력 방식입니다."
     )
 
+    # 이름 입력만으로는 조회하지 않고, 확인 버튼을 눌렀을 때 한 번만 조회한다.
+    with st.form("member_lookup_form", clear_on_submit=False):
+        typed_name = st.text_input(
+            "이름(풀네임)",
+            value=st.session_state.get("confirmed_member_name", ""),
+            placeholder="예: 조서영",
+        )
+        lookup_clicked = st.form_submit_button("내 정보 불러오기", type="primary")
+
+    if lookup_clicked:
+        display_name = normalize_display_name(typed_name)
+        if not display_name:
+            st.error("본인 풀네임을 입력해 주세요.")
+            st.session_state.pop("confirmed_member_name", None)
+            st.session_state.pop("confirmed_member_id", None)
+            return
+
+        try:
+            members = list_members(active_only=True)
+        except Exception as exc:
+            st.error(f"부원 정보를 불러오지 못했습니다: {exc}")
+            return
+
+        existing_member = next(
+            (m for m in members if normalize_name_key(m.name) == normalize_name_key(display_name)),
+            None,
+        )
+
+        st.session_state["confirmed_member_name"] = display_name
+        st.session_state["confirmed_member_id"] = existing_member.id if existing_member else ""
+
+    display_name = st.session_state.get("confirmed_member_name", "")
+    if not display_name:
+        st.info("이름을 입력하고 **내 정보 불러오기**를 눌러 주세요.")
+        return
+
+    member_id = st.session_state.get("confirmed_member_id", "")
+
+    # 캐시 덕분에 여기부터는 체크박스를 눌러 재실행되어도 네트워크 요청이 거의 발생하지 않는다.
     try:
         members = list_members(active_only=True)
     except Exception as exc:
         st.error(f"부원 정보를 불러오지 못했습니다: {exc}")
         return
 
-    name_input = st.text_input("이름(풀네임)", placeholder="예: 조서영")
-    display_name = normalize_display_name(name_input)
-    if not display_name:
-        st.info("본인 풀네임을 입력해 주세요.")
-        return
-
-    name_key = normalize_name_key(display_name)
-    existing_member = next(
-        (m for m in members if normalize_name_key(m.name) == name_key),
-        None,
-    )
+    existing_member = next((m for m in members if m.id == member_id), None) if member_id else None
 
     if existing_member:
         st.success(f"기존 부원 정보를 찾았습니다: {existing_member.name}")
         part_options = list(dict.fromkeys(PARTS + existing_member.parts))
         default_parts = existing_member.parts
-        part_key = f"parts_existing_{existing_member.id}"
+        part_key = f"parts_existing_{period.id}_{existing_member.id}"
         widget_key = existing_member.id
 
         try:
@@ -706,12 +751,12 @@ def page_my_schedule(period: SchedulePeriod) -> None:
         existing_slots = set(old_schedule.selected_slots) if old_schedule else set()
         if old_schedule:
             st.caption("기존에 제출한 스케줄을 불러왔습니다. 수정 후 다시 저장할 수 있습니다.")
-
     else:
         st.info("처음 등록하는 이름입니다. 저장하면 부원 명단에 자동으로 추가됩니다.")
         part_options = PARTS
         default_parts = []
-        part_key = f"parts_new_{name_key}"
+        name_key = normalize_name_key(display_name)
+        part_key = f"parts_new_{period.id}_{name_key}"
         widget_key = f"new_{name_key}"
         existing_slots = set()
 
@@ -743,6 +788,8 @@ def page_my_schedule(period: SchedulePeriod) -> None:
             st.error(f"저장 중 오류가 발생했습니다: {exc}")
             return
 
+        st.session_state["confirmed_member_name"] = saved.name
+        st.session_state["confirmed_member_id"] = saved.id
         st.success(
             f"저장되었습니다! {saved.name} · "
             f"파트: {', '.join(saved.parts)} · 가능 시간 {len(selected_slots)}개"
