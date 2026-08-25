@@ -14,7 +14,7 @@ PARTS = [
     "기타2",
     "베이스",
     "드럼",
-    "건반",
+    "건반1",
     "건반2",
     "기타/그 외",
 ]
@@ -888,28 +888,52 @@ def page_admin(period: Optional[SchedulePeriod]) -> None:
                 value=period.name if period else "",
                 placeholder="예: 2026 가을 정기공연",
             )
+
+            st.caption(
+                "날짜는 YYYY-MM-DD, 시간은 HH:MM 형식으로 입력해 주세요. "
+                "입력 중에는 저장되지 않고 아래 저장 버튼을 눌렀을 때 한 번에 반영됩니다."
+            )
+
             col1, col2 = st.columns(2)
 
             with col1:
-                start_date = st.date_input(
+                start_date_text = st.text_input(
                     "시작 날짜",
-                    value=period.start_date if period else date.today(),
+                    value=(
+                        period.start_date.isoformat()
+                        if period
+                        else date.today().isoformat()
+                    ),
+                    placeholder="예: 2026-09-01",
                 )
-                start_time = st.time_input(
+                start_time_text = st.text_input(
                     "하루 시작 시간",
-                    value=period.start_time if period else time(18, 0),
-                    step=1800,
+                    value=(
+                        period.start_time.strftime("%H:%M")
+                        if period
+                        else "18:00"
+                    ),
+                    placeholder="예: 18:00",
                 )
 
             with col2:
-                end_date = st.date_input(
+                end_date_text = st.text_input(
                     "종료 날짜",
-                    value=period.end_date if period else date.today() + timedelta(days=14),
+                    value=(
+                        period.end_date.isoformat()
+                        if period
+                        else (date.today() + timedelta(days=14)).isoformat()
+                    ),
+                    placeholder="예: 2026-09-14",
                 )
-                end_time = st.time_input(
+                end_time_text = st.text_input(
                     "하루 종료 시간",
-                    value=period.end_time if period else time(22, 0),
-                    step=1800,
+                    value=(
+                        period.end_time.strftime("%H:%M")
+                        if period
+                        else "22:00"
+                    ),
+                    placeholder="예: 22:00",
                 )
 
             slot_minutes = st.selectbox(
@@ -917,22 +941,56 @@ def page_admin(period: Optional[SchedulePeriod]) -> None:
                 [30, 60],
                 index=0 if period and period.slot_minutes == 30 else 1,
             )
-            save_clicked = st.form_submit_button("새 일정 기간으로 저장", type="primary")
+            save_clicked = st.form_submit_button(
+                "일정 기간 저장",
+                type="primary",
+            )
 
         if save_clicked:
             if not name.strip():
                 st.error("일정 이름을 입력해 주세요.")
-            elif end_date < start_date:
-                st.error("종료 날짜가 시작 날짜보다 빠릅니다.")
-            elif end_time <= start_time:
-                st.error("종료 시간은 시작 시간보다 늦어야 합니다.")
             else:
                 try:
-                    save_period(name, start_date, end_date, start_time, end_time, slot_minutes)
-                    st.success("새 일정 기간이 생성되었습니다.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"저장 중 오류: {exc}")
+                    start_date = datetime.strptime(
+                        start_date_text.strip(),
+                        "%Y-%m-%d",
+                    ).date()
+                    end_date = datetime.strptime(
+                        end_date_text.strip(),
+                        "%Y-%m-%d",
+                    ).date()
+                    start_time = datetime.strptime(
+                        start_time_text.strip(),
+                        "%H:%M",
+                    ).time()
+                    end_time = datetime.strptime(
+                        end_time_text.strip(),
+                        "%H:%M",
+                    ).time()
+                except ValueError:
+                    st.error(
+                        "날짜/시간 형식을 확인해 주세요. "
+                        "날짜는 2026-09-01, 시간은 18:00처럼 입력하면 됩니다."
+                    )
+                else:
+                    if end_date < start_date:
+                        st.error("종료 날짜가 시작 날짜보다 빠릅니다.")
+                    elif end_time <= start_time:
+                        st.error("종료 시간은 시작 시간보다 늦어야 합니다.")
+                    else:
+                        try:
+                            save_period(
+                                name,
+                                start_date,
+                                end_date,
+                                start_time,
+                                end_time,
+                                slot_minutes,
+                            )
+                            st.success("일정 기간이 저장되었습니다.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"저장 중 오류: {exc}")
 
     with tab_teams:
         if not period:
